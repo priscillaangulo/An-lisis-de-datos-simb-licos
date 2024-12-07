@@ -1,0 +1,438 @@
+---
+title: "Artículo Análisis de datos"
+author: "Priscilla Angulo Chaves"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(ADGofTest)
+library(ggplot2)
+library(ggrepel)
+library(caret)
+library(lattice)
+library(readxl)
+library(readr)
+library(dplyr)
+library(plotly)
+library(rpart.plot)
+library(xgboost)
+library(fastDummies)
+library(dummy)
+library(RColorBrewer)
+library(glmnet)
+library(Matrix)
+library(scales)
+library(traineR)
+library(kableExtra)
+library(MASS)
+library(RSDA)
+library(stats)
+library(symbolicDA)
+library(tidyr)
+```
+
+
+
+
+
+
+
+
+
+
+# Predictor de horas de sueño
+
+
+```{r}
+#Leer la tabla de datos sobre calidad del sueño
+datos.dormir <- read.csv("wearable_tech_sleep_quality_extended.csv") 
+
+#Cambiar el nombre de las columnas
+colnames(datos.dormir) <- c("HRV", "Temp", "Mov", "Hours", "Score", "Caff", "Stress", "Consis", "Light")        
+
+#Agrupar los score en intervalos de 0.5 en 0.5
+#datos.dormir <- datos.dormir %>% mutate(Score_Int = cut(Score, breaks = seq(0, 10, by = 0.5), include.lowest = TRUE)) 
+
+#Ver la tabla
+head(datos.dormir)   
+datos.dormir
+```
+
+```{r}
+#Convertir los datos a simbólicos por medio de la variable "Score_Int", eleminar de las variables "score"
+datos.dormir.sym <- classic.to.sym(datos.dormir, concept =Score , variables = c("HRV", "Temp", "Mov", "Hours", "Caff", "Stress", "Consis", "Light"))
+
+#ver la tabla simbólica
+datos.dormir.sym
+```
+
+```{r}
+#Crear datos de entrenamiento y prueba en la tabla simbólica
+set.seed(123) 
+trainIndex <- sample(seq_len(nrow(datos.dormir.sym)), size = 0.7 * nrow(datos.dormir.sym))
+trainData <- datos.dormir.sym[trainIndex, ]
+testData <- datos.dormir.sym[-trainIndex, ]
+```
+
+
+
+# Código que toma un vector de valores para minsplit y otro para maxdepth, genera arboles con las combinaciones de los valores. Para cada uno calculo el RMSE por límite inferior y superior de los intervalos, luego arroja una tabla con los resultados para comparar.
+
+```{r}
+# Valores de parámetros a evaluar
+minsplit_values <- c(2, 5, 10, 15)
+maxdepth_values <- c(3, 4, 5, 6)
+
+#DataFrame para almacenar resultados
+results <- data.frame(minsplit = integer(),
+                      maxdepth = integer(),
+                      train_rmse_inf = numeric(),
+                      test_rmse_inf = numeric(),
+                      dif_rmse_inf= numeric(),
+                      train_rmse_sup = numeric(),
+                      test_rmse_sup = numeric(),
+                      dif_rmse_sup= numeric()
+                      )
+
+
+for (minsplit in minsplit_values) {
+  for (maxdepth in maxdepth_values) {
+    
+    # Arbol con la combinación de parámetros
+    arbol <- sym.rt(
+      formula = Hours ~ ., 
+      sym.data = trainData, 
+      method = "cm", 
+      minsplit = minsplit, 
+      maxdepth = maxdepth
+    )
+    
+   
+  ### PREDICCIONES
+    
+   train_pred <- sym.predict(model= arbol, new.sym.data =  trainData)
+   test_pred <- sym.predict(model= arbol, new.sym.data =  testData)
+   
+   ## Por limite inferior 
+   train_mse_inf <- mean((min(trainData$Hours) - train_pred[,1])^2)
+   test_mse_inf <- mean((min(testData$Hours) - test_pred[,1])^2)
+   train_rmse_inf <- sqrt(train_mse_inf)
+   test_rmse_inf <- sqrt(test_mse_inf)
+
+   
+  ## Por limite superior  
+   train_mse_sup <- mean((max(trainData$Hours) - train_pred[,2])^2)
+   test_mse_sup <- mean((max(testData$Hours) - test_pred[,2])^2)
+   train_rmse_sup <- sqrt(train_mse_sup)
+   test_rmse_sup <- sqrt(test_mse_sup)    
+    
+
+    
+    # Resultado
+    results <- rbind(results, data.frame(minsplit = minsplit,
+                                         maxdepth = maxdepth,
+                                         train_rmse_inf = train_rmse_inf,
+                                         test_rmse_inf = test_rmse_inf,
+                                         dif_rmse_inf = abs(train_rmse_inf - test_rmse_inf),
+                                         train_rmse_sup = train_rmse_sup,
+                                         test_rmse_sup = test_rmse_sup,
+                                         dif_rmse_sup = abs(train_rmse_sup - test_rmse_sup)
+                                         ))
+  }
+}
+
+results
+
+```
+
+
+```{r}
+min_row.inf <-results[which.min(results$dif_rmse_inf), c("minsplit", "maxdepth", "dif_rmse_inf")]
+min_row.sup <-results[which.min(results$dif_rmse_sup), c("minsplit", "maxdepth", "dif_rmse_sup")]
+min_row.inf
+min_row.sup
+```
+
+
+
+
+
+
+
+```{r}
+df_long <- pivot_longer(results, cols = c(dif_rmse_inf, dif_rmse_sup), 
+                        names_to = "metric", values_to = "value")
+
+
+ggplot(df_long, aes(x = factor(minsplit), y = value, fill = factor(maxdepth))) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  facet_wrap(~ metric, labeller = as_labeller(c(
+    dif_rmse_inf = "dif_rmse_inf",
+    dif_rmse_sup = "dif_rmse_sup"
+  ))) +
+  labs(
+    title = "Comparación entre las diferencias de los RMSE por minsplit y maxdepth",
+    x = "minsplit",
+    y = "dif_rmse value",
+    fill = "maxdepth"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12)
+  )
+```
+# MEJOR ARBOL
+
+```{r}
+#Arbol con parametros minsplit=2 maxdepth=5.
+ arbol <- sym.rt(
+      formula = Hours ~ ., 
+      sym.data = testData, 
+      method = "cm", 
+      minsplit = 10, 
+      maxdepth = 3
+    )
+   train_pred <- sym.predict(model= arbol, new.sym.data =  testData)
+   train_mse <- mean((min(testData$Hours) - train_pred[,1])^2)
+#   train_mse
+ #  var_hours <- var(trainData$Hours)
+  
+```
+
+
+```{r}
+print(arbol)
+plot(arbol)
+text(arbol, pretty = 0, cex = 0.8)
+```
+
+
+
+
+
+
+```{r}
+# Ajustar el tamaño del gráfico
+par(mar = c(4, 4, 4, 4)) # Ajustar los márgenes del gráfico si es necesario
+plot(arbol, uniform = TRUE, margin = 0.1) # uniform TRUE para mantener el árbol balanceado
+text(arbol, pretty = 0, cex = 1, col = "darkgreen") # Ajustar el tamaño del texto y color
+
+# Guardar el gráfico en alta resolución (opcional)
+png("arbol_decision.png", width = 1200, height = 800, res = 150) # Guardar en un archivo
+plot(arbol, uniform = TRUE, margin = 0.1)
+text(arbol, pretty = 0, cex = 1, col = "blue")
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Cardiological
+
+```{r}
+data(cardiologicalv2)
+datos.cardio <- cardiologicalv2
+datos.cardio
+colnames(datos.cardio)
+str(datos.cardio)
+```
+
+```{r}
+
+
+# Extraer los valores `lower` de `Syst` y `Diast` y luego usar `ifelse`
+systolic_lower <- sapply(data.cardio$Syst, function(x) min(x))
+diastolic_lower <- sapply(data.cardio$Diast, function(x) max(x))
+
+# Crear la variable Riesgo en función de los valores extraídos
+data.cardio$Riesgo <- ifelse(systolic_lower > 120 & diastolic_lower > 80, "Alto", "Bajo")
+
+# Convertir Riesgo en un factor
+data.cardio$Riesgo <- as.factor(data.cardio$Riesgo)
+
+# Verificar la nueva columna Riesgo
+data.cardio
+
+```
+
+
+
+```{r}
+#Crear datos de entrenamiento y prueba en la tabla simbólica
+set.seed(456) 
+trainIndex.C <- sample(seq_len(nrow(datos.cardio)), size = 0.7 * nrow(datos.cardio))
+trainData.C <- datos.cardio[trainIndex.C, ]
+testData.C <- datos.cardio[-trainIndex.C, ]
+```
+
+```{r}
+# Valores de parámetros a evaluar
+minsplit_values <- c(2, 5, 10, 15)
+maxdepth_values <- c(3, 4, 5, 6)
+
+#DataFrame para almacenar resultados
+results2 <- data.frame(minsplit = integer(),
+                      maxdepth = integer(),
+                      train_rmse_inf.C = numeric(),
+                      test_rmse_inf.C = numeric(),
+                      dif_rmse_inf.C= numeric(),
+                      train_rmse_sup.C = numeric(),
+                      test_rmse_sup.C = numeric(),
+                      dif_rmse_sup.C= numeric()
+                      )
+
+
+for (minsplit in minsplit_values) {
+  for (maxdepth in maxdepth_values) {
+    
+    # Arbol con la combinación de parámetros
+    arbol_cardiologico <- sym.rt(
+      formula = Pulse ~ ., 
+      sym.data = trainData.C, 
+      method = "cm", 
+      minsplit = minsplit, 
+      maxdepth = maxdepth
+    )
+    
+   
+  ### PREDICCIONES
+    
+   train_pred.C <- sym.predict(model= arbol_cardiologico, new.sym.data =  trainData.C)
+   test_pred.C <- sym.predict(model= arbol_cardiologico, new.sym.data =  testData.C)
+   
+   ## Por limite inferior 
+   train_mse_inf.C <- mean((min(trainData.C$Pulse) - train_pred.C[,1])^2)
+   test_mse_inf.C <- mean((min(testData.C$Pulse) - test_pred.C[,1])^2)
+   train_rmse_inf.C <- sqrt(train_mse_inf.C)
+   test_rmse_inf.C <- sqrt(test_mse_inf.C)
+
+   
+  ## Por limite superior  
+   train_mse_sup.C <- mean((max(trainData.C$Pulse) - train_pred.C[,2])^2)
+   test_mse_sup.C <- mean((max(testData.C$Pulse) - test_pred.C[,2])^2)
+   train_rmse_sup.C <- sqrt(train_mse_sup.C)
+   test_rmse_sup.C <- sqrt(test_mse_sup.C)    
+    
+
+    
+    # Resultado
+    results2 <- rbind(results2, data.frame(minsplit = minsplit,
+                                         maxdepth = maxdepth,
+                                         train_rmse_inf.C = train_rmse_inf.C,
+                                         test_rmse_inf.C = test_rmse_inf.C,
+                                         dif_rmse_inf.C = abs(train_rmse_inf.C - test_rmse_inf.C),
+                                         train_rmse_sup.C = train_rmse_sup.C,
+                                         test_rmse_sup.C = test_rmse_sup.C,
+                                         dif_rmse_sup.C = abs(train_rmse_sup.C - test_rmse_sup.C)
+                                         ))
+  }
+}
+
+results2
+
+```
+
+```{r}
+min_row.inf.C <-results2[which.min(results2$dif_rmse_inf.C), c("minsplit", "maxdepth", "dif_rmse_inf.C")]
+min_row.sup.C <-results2[which.min(results2$dif_rmse_sup.C), c("minsplit", "maxdepth", "dif_rmse_sup.C")]
+min_row.inf.C
+min_row.sup.C
+```
+
+
+
+```{r}
+df_long <- pivot_longer(results2, cols = c(dif_rmse_inf.C, dif_rmse_sup.C), 
+                        names_to = "metric", values_to = "value")
+
+
+ggplot(df_long, aes(x = factor(minsplit), y = value, fill = factor(maxdepth))) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  facet_wrap(~ metric, labeller = as_labeller(c(
+    dif_rmse_inf.C = "dif_rmse_inf.C",
+    dif_rmse_sup.C = "dif_rmse_sup.C"
+  ))) +
+  labs(
+    title = "Comparación entre las diferencias de los RMSE por minsplit y maxdepth",
+    x = "minsplit",
+    y = "dif_rmse value",
+    fill = "maxdepth"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12)
+  )
+```
+
+```{r}
+  arbol_cardiologico <- sym.rt(
+      formula = Pulse ~ ., 
+      sym.data = testData.C, 
+      method = "cm", 
+      minsplit = 5, 
+      maxdepth = 6
+    )
+    
+# Visualizar el árbol de decisión
+
+# Ajustar el tamaño del gráfico
+par(mar = c(4, 4, 4, 4)) # Ajustar los márgenes del gráfico si es necesario
+plot(arbol_cardiologico, uniform = TRUE, margin = 0.1) # uniform TRUE para mantener el árbol balanceado
+text(arbol_cardiologico, pretty = 0, cex = 1, col = "purple") # Ajustar el tamaño del texto y color
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ## Por centros
+   train_centros <- (max(trainData$Hours)-min(trainData$Hours))/2
+   test_centros <- (max(testData$Hours)-min(testData$Hours))/2
+   train_pred_cen <- (train_pred_sup[,2] -train_pred[,1])/2
+   test_pred_cen <- (test_pred_sup[,2] -test_pred[,1])/2
+   
+
+   train_mse_cen <- mean((train_centros - train_pred_cen)^2)
+   test_mse_cen <- mean((max(testData$Hours) - test_pred_cen)^2)
+   
+
+
